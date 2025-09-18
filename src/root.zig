@@ -3,6 +3,7 @@ const math = std.math;
 
 pub fn EKF(comptime T: type) type {
     return struct {
+        const Self = @This();
         x: [7]T,
         P: [7][7]T,
         Q: [7][7]T,
@@ -10,8 +11,8 @@ pub fn EKF(comptime T: type) type {
         R_mag: [3][3]T,
 
         // GANTI: Tambahkan 4 parameter ke signature fungsi
-        pub fn init(q_quat: f64, q_bias: f64, r_acc: f64, r_mag: f64) EKF {
-            var ekf = EKF{
+        pub fn init(q_quat: f64, q_bias: f64, r_acc: f64, r_mag: f64) Self {
+            var ekf = Self{
                 .x = .{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
                 .P = std.mem.zeroes([7][7]f64),
                 .Q = std.mem.zeroes([7][7]f64),
@@ -41,7 +42,7 @@ pub fn EKF(comptime T: type) type {
             return ekf;
         }
 
-        pub fn predict(self: *EKF, gx: T, gy: T, gz: T, dt: T) void {
+        pub fn predict(self: *Self, gx: T, gy: T, gz: T, dt: T) void {
             // Remove bias from gyroscope measurements
             const wx = gx - self.x[4];
             const wy = gy - self.x[5];
@@ -133,7 +134,7 @@ pub fn EKF(comptime T: type) type {
             matrixAdd(FPFt, self.Q, &self.P);
         }
 
-        pub fn updateAccelerometer(self: *EKF, ax: T, ay: T, az: T) void {
+        pub fn updateAccelerometer(self: *Self, ax: T, ay: T, az: T) void {
             // Normalize accelerometer
             const norm = math.sqrt(ax * ax + ay * ay + az * az);
             if (norm < 1e-6) return;
@@ -181,7 +182,7 @@ pub fn EKF(comptime T: type) type {
             self.kalmanUpdate(H, residual, self.R_acc);
         }
 
-        pub fn updateMagnetometer(self: *EKF, mx: T, my: T, mz: T) void {
+        pub fn updateMagnetometer(self: *Self, mx: T, my: T, mz: T) void {
             // Normalize magnetometer
             const norm = math.sqrt(mx * mx + my * my + mz * mz);
             if (norm < 1e-6) return;
@@ -232,7 +233,7 @@ pub fn EKF(comptime T: type) type {
             self.kalmanUpdate(H, residual, self.R_mag);
         }
 
-        fn kalmanUpdate(self: *EKF, H: [3][7]T, residual: [3]T, R: [3][3]T) void {
+        fn kalmanUpdate(self: *Self, H: [3][7]T, residual: [3]T, R: [3][3]T) void {
             // S = H*P*H^T + R
             var HP = std.mem.zeroes([3][7]T);
             matrixMultiply3x7(H, self.P, &HP);
@@ -287,13 +288,13 @@ pub fn EKF(comptime T: type) type {
             self.normalizeQuaternion();
         }
 
-        pub fn update(self: *EKF, gx: T, gy: T, gz: T, ax: T, ay: T, az: T, mx: T, my: T, mz: T, dt: T) void {
+        pub fn update(self: *Self, gx: T, gy: T, gz: T, ax: T, ay: T, az: T, mx: T, my: T, mz: T, dt: T) void {
             self.predict(gx, gy, gz, dt);
             self.updateAccelerometer(ax, ay, az);
             self.updateMagnetometer(mx, my, mz);
         }
 
-        pub fn getEuler(self: *const EKF) struct { roll: T, pitch: T, yaw: T } {
+        pub fn getEuler(self: *const Self) struct { roll: T, pitch: T, yaw: T } {
             const q0 = self.x[0];
             const q1 = self.x[1];
             const q2 = self.x[2];
@@ -316,11 +317,11 @@ pub fn EKF(comptime T: type) type {
             };
         }
 
-        pub fn getQuaternion(self: *const EKF) [4]T {
+        pub fn getQuaternion(self: *const Self) [4]T {
             return .{ self.x[0], self.x[1], self.x[2], self.x[3] };
         }
 
-        fn normalizeQuaternion(self: *EKF) void {
+        fn normalizeQuaternion(self: *Self) void {
             const norm = math.sqrt(self.x[0] * self.x[0] + self.x[1] * self.x[1] +
                 self.x[2] * self.x[2] + self.x[3] * self.x[3]);
             if (norm > 1e-6) {
