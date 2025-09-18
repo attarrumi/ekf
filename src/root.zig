@@ -1,434 +1,439 @@
 const std = @import("std");
 const math = std.math;
 
-pub const EKF = struct {
-    // State vector (quaternion): [q0, q1, q2, q3]
-    x: []f32,
-    // State covariance matrix (4x4)
-    P: []f32,
-    // Process noise covariance (4x4)
-    Q: []f32,
-    // Measurement noise covariance (6x6)
-    R: []f32,
-    // Time step
-    dt: f32,
+pub fn EKF(comptime T: type) type {
+    return struct {
+        x: [7]T,
+        P: [7][7]T,
+        Q: [7][7]T,
+        R_acc: [3][3]T,
+        R_mag: [3][3]T,
 
-    allocator: std.mem.Allocator,
+        // GANTI: Tambahkan 4 parameter ke signature fungsi
+        pub fn init(q_quat: f64, q_bias: f64, r_acc: f64, r_mag: f64) EKF {
+            var ekf = EKF{
+                .x = .{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+                .P = std.mem.zeroes([7][7]f64),
+                .Q = std.mem.zeroes([7][7]f64),
+                .R_acc = std.mem.zeroes([3][3]f64),
+                .R_mag = std.mem.zeroes([3][3]f64),
+            };
 
-    accel_filt: [3]f32,
-    mag_filt: [3]f32,
-    alpha_accel: f32,
-    alpha_mag: f32,
-
-    const Self = @This();
-
-    pub fn init(allocator: std.mem.Allocator, P: f32, Q: f32, R: f32) !Self {
-        var ekf = Self{
-            .x = try allocator.alloc(f32, 4),
-            .P = try allocator.alloc(f32, 16), // 4x4
-            .Q = try allocator.alloc(f32, 16), // 4x4
-            .R = try allocator.alloc(f32, 36), // 6x6
-            .dt = 0.01,
-            .allocator = allocator,
-            .accel_filt = .{ 0.0, 0.0, 0.0 },
-            .mag_filt = .{ 0.0, 0.0, 0.0 },
-            .alpha_accel = 0.33,
-            .alpha_mag = 0.33,
-        };
-
-        // Initialize quaternion: [1, 0, 0, 0]
-        ekf.x[0] = 1.0;
-        ekf.x[1] = 0.0;
-        ekf.x[2] = 0.0;
-        ekf.x[3] = 0.0;
-
-        // Initialize P as 0.1 * identity
-        for (0..16) |i| {
-            ekf.P[i] = if (i % 5 == 0) P else 0.0; // Diagonal elements
-            // ekf.P[i] = if (i % 5 == 0) 0.01 else 0.0; // Diagonal elements
-        }
-
-        // Initialize Q as 0.0001 * identity
-        for (0..16) |i| {
-            ekf.Q[i] = if (i % 5 == 0) Q else 0.0;
-            // ekf.Q[i] = if (i % 5 == 0) 0.0001 else 0.0;
-        }
-
-        // Initialize R as 0.01 * identity
-        for (0..36) |i| {
-            ekf.R[i] = if (i % 7 == 0) R else 0.0;
-            // ekf.R[i] = if (i % 7 == 0) 0.01 else 0.0;
-        }
-
-        return ekf;
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.allocator.free(self.x);
-        self.allocator.free(self.P);
-        self.allocator.free(self.Q);
-        self.allocator.free(self.R);
-    }
-
-    // Quaternion multiplication matrix (right multiply)
-    fn quatMultMatrix(q: [4]f32) [4][4]f32 {
-        const q0 = q[0];
-        const q1 = q[1];
-        const q2 = q[2];
-        const q3 = q[3];
-
-        return .{
-            .{ q0, -q1, -q2, -q3 },
-            .{ q1, q0, -q3, q2 },
-            .{ q2, q3, q0, -q1 },
-            .{ q3, -q2, q1, q0 },
-        };
-    }
-
-    // Normalize quaternion
-    fn normalizeQuat(q: [4]f32) [4]f32 {
-        var norm: f32 = 0.0;
-        for (0..4) |i| {
-            norm += q[i] * q[i];
-        }
-        norm = std.math.sqrt(norm);
-        if (norm < 1e-10) return q; // Avoid division by zero
-        return .{ q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm };
-    }
-
-    // Normalize quaternion in-place for slice
-    fn normalizeQuatSlice(self: *Self) void {
-        var norm: f32 = 0.0;
-        for (0..4) |i| {
-            norm += self.x[i] * self.x[i];
-        }
-        norm = std.math.sqrt(norm);
-        if (norm < 1e-10) return; // Avoid division by zero
-        for (0..4) |i| {
-            self.x[i] /= norm;
-        }
-    }
-
-    fn lowPassFilter(prev: *[3]f32, input: [3]f32, alpha: f32) void {
-        for (0..3) |i| {
-            prev[i] = alpha * input[i] + (1.0 - alpha) * prev[i];
-        }
-    }
-
-    // Matrix multiplication: [m x n] * [n x p] -> [m x p]
-    fn matMul(m: usize, n: usize, p: usize, a: []const f32, b: []const f32, out: []f32) void {
-        std.debug.assert(a.len >= m * n);
-        std.debug.assert(b.len >= n * p);
-        std.debug.assert(out.len >= m * p);
-        for (0..m) |i| {
-            for (0..p) |j| {
-                var sum: f32 = 0.0;
-                for (0..n) |k| {
-                    sum += a[i * n + k] * b[k * p + j];
-                }
-                out[i * p + j] = sum;
-            }
-        }
-    }
-
-    // Matrix transpose: [m x n] -> [n x m]
-    fn matTranspose(m: usize, n: usize, a: []const f32, out: []f32) void {
-        std.debug.assert(a.len >= m * n);
-        std.debug.assert(out.len >= n * m);
-        for (0..m) |i| {
-            for (0..n) |j| {
-                out[j * m + i] = a[i * n + j];
-            }
-        }
-    }
-
-    // Matrix addition: [m x n] + [m x n] -> [m x n]
-    fn matAdd(m: usize, n: usize, a: []const f32, b: []const f32, out: []f32) void {
-        std.debug.assert(a.len >= m * n);
-        std.debug.assert(b.len >= m * n);
-        std.debug.assert(out.len >= m * n);
-        for (0..m * n) |i| {
-            out[i] = a[i] + b[i];
-        }
-    }
-
-    // Matrix subtraction: [m x n] - [m x n] -> [m x n]
-    fn matSub(m: usize, n: usize, a: []const f32, b: []const f32, out: []f32) void {
-        std.debug.assert(a.len >= m * n);
-        std.debug.assert(b.len >= m * n);
-        std.debug.assert(out.len >= m * n);
-        for (0..m * n) |i| {
-            out[i] = a[i] - b[i];
-        }
-    }
-
-    // Matrix inverse (n x n) using Gaussian elimination with partial pivoting
-    fn matInverse(n: usize, a: []const f32, out: []f32, allocator: std.mem.Allocator) !void {
-        std.debug.assert(a.len >= n * n);
-        std.debug.assert(out.len >= n * n);
-        var aug = try allocator.alloc(f32, n * 2 * n);
-        defer allocator.free(aug);
-
-        // Initialize augmented matrix [A | I]
-        for (0..n) |i| {
-            for (0..n) |j| {
-                aug[i * (2 * n) + j] = a[i * n + j];
-                aug[i * (2 * n) + (j + n)] = if (i == j) 1.0 else 0.0;
-            }
-        }
-
-        // Gaussian elimination with partial pivoting
-        for (0..n) |col| {
-            // Find pivot
-            var pivot: usize = col;
-            for (col + 1..n) |i| {
-                if (@abs(aug[i * (2 * n) + col]) > @abs(aug[pivot * (2 * n) + col])) {
-                    pivot = i;
-                }
+            // Inisialisasi P tetap sama
+            for (0..7) |i| {
+                ekf.P[i][i] = if (i < 4) 0.1 else 0.01;
             }
 
-            // Swap rows
-            if (pivot != col) {
-                for (0..2 * n) |j| {
-                    const temp = aug[col * (2 * n) + j];
-                    aug[col * (2 * n) + j] = aug[pivot * (2 * n) + j];
-                    aug[pivot * (2 * n) + j] = temp;
-                }
+            // Process noise - GANTI: Gunakan parameter dari argumen
+            for (0..4) |i| {
+                ekf.Q[i][i] = q_quat; // Menggunakan q_quat
+            }
+            for (4..7) |i| {
+                ekf.Q[i][i] = q_bias; // Menggunakan q_bias
             }
 
-            // Check for singularity
-            if (@abs(aug[col * (2 * n) + col]) < 1e-10) {
-                return error.SingularMatrix;
-            }
-
-            // Normalize pivot row
-            const div = aug[col * (2 * n) + col];
-            for (col..2 * n) |j| {
-                aug[col * (2 * n) + j] /= div;
-            }
-
-            // Eliminate column
-            for (0..n) |row| {
-                if (row == col) continue;
-                const factor = aug[row * (2 * n) + col];
-                for (col..2 * n) |j| {
-                    aug[row * (2 * n) + j] -= factor * aug[col * (2 * n) + j];
-                }
-            }
-        }
-
-        // Extract inverse
-        for (0..n) |i| {
-            for (0..n) |j| {
-                out[i * n + j] = aug[i * (2 * n) + (j + n)];
-            }
-        }
-    }
-
-    fn applyMagDeclination(mag: [3]f32, declination: f32) [3]f32 {
-        const cosD = std.math.cos(declination);
-        const sinD = std.math.sin(declination);
-        return .{
-            mag[0] * cosD - mag[1] * sinD,
-            mag[0] * sinD + mag[1] * cosD,
-            mag[2],
-        };
-    }
-
-    // Predict step using gyroscope data
-    pub fn predict(self: *Self, gyro: [3]f32, dt: f32) void {
-        // Angular velocities
-        const wx = gyro[0];
-        const wy = gyro[1];
-        const wz = gyro[2];
-
-        self.dt = dt;
-
-        // Construct omega matrix (4x4)
-        var omega = [_]f32{0} ** 16;
-        omega[0 * 4 + 1] = -wx * 0.5 * self.dt;
-        omega[0 * 4 + 2] = -wy * 0.5 * self.dt;
-        omega[0 * 4 + 3] = -wz * 0.5 * self.dt;
-        omega[1 * 4 + 0] = wx * 0.5 * self.dt;
-        omega[1 * 4 + 2] = wz * 0.5 * self.dt;
-        omega[1 * 4 + 3] = -wy * 0.5 * self.dt;
-        omega[2 * 4 + 0] = wy * 0.5 * self.dt;
-        omega[2 * 4 + 1] = -wz * 0.5 * self.dt;
-        omega[2 * 4 + 3] = wx * 0.5 * self.dt;
-        omega[3 * 4 + 0] = wz * 0.5 * self.dt;
-        omega[3 * 4 + 1] = wy * 0.5 * self.dt;
-        omega[3 * 4 + 2] = -wx * 0.5 * self.dt;
-
-        // State transition matrix F = I + omega
-        var F = [_]f32{0} ** 16;
-        for (0..4) |i| {
-            F[i * 4 + i] = 1.0;
-        }
-        matAdd(4, 4, &F, &omega, &F);
-
-        // Predict state: x = F * x
-        var new_x = [_]f32{0} ** 4;
-        matMul(4, 4, 1, &F, self.x, &new_x);
-        for (0..4) |i| {
-            self.x[i] = new_x[i];
-        }
-        self.normalizeQuatSlice();
-
-        // Predict covariance: P = F * P * F' + Q
-        var temp = [_]f32{0} ** 16;
-        var Ft = [_]f32{0} ** 16;
-        matTranspose(4, 4, &F, &Ft);
-        matMul(4, 4, 4, &F, self.P, &temp);
-        matMul(4, 4, 4, &temp, &Ft, &temp);
-        matAdd(4, 4, &temp, self.Q, self.P);
-    }
-
-    // Update step using accelerometer and magnetometer
-    pub fn update(self: *Self, accel: [3]f32, mag: [3]f32) !void {
-        self.accel_filt = accel;
-        self.mag_filt = mag;
-        // Filter sensor dulu
-        // lowPassFilter(&self.accel_filt, accel, self.alpha_accel);
-        // lowPassFilter(&self.mag_filt, mag, self.alpha_mag);
-
-        // Pakai hasil filter
-        var accel_norm = self.accel_filt;
-        var mag_norm = self.mag_filt;
-
-        mag_norm = applyMagDeclination(mag_norm, 0.0133808576);
-
-        var norm: f32 = 0.0;
-        for (0..3) |i| {
-            norm += accel[i] * accel[i];
-        }
-        norm = std.math.sqrt(norm);
-        if (norm > 1e-10) {
+            // Measurement noise - GANTI: Gunakan parameter dari argumen
             for (0..3) |i| {
-                accel_norm[i] /= norm;
+                ekf.R_acc[i][i] = r_acc; // Menggunakan r_acc
+                ekf.R_mag[i][i] = r_mag; // Menggunakan r_mag
             }
+
+            return ekf;
         }
 
-        norm = 0.0;
-        for (0..3) |i| {
-            norm += mag[i] * mag[i];
+        pub fn predict(self: *EKF, gx: T, gy: T, gz: T, dt: T) void {
+            // Remove bias from gyroscope measurements
+            const wx = gx - self.x[4];
+            const wy = gy - self.x[5];
+            const wz = gz - self.x[6];
+
+            // Current quaternion
+            const q0 = self.x[0];
+            const q1 = self.x[1];
+            const q2 = self.x[2];
+            const q3 = self.x[3];
+
+            // Quaternion derivative matrix (omega matrix)
+            const omega = [_][4]T{
+                .{ 0.0, -wx, -wy, -wz },
+                .{ wx, 0.0, wz, -wy },
+                .{ wy, -wz, 0.0, wx },
+                .{ wz, wy, -wx, 0.0 },
+            };
+
+            // Apply quaternion update: q_dot = 0.5 * omega * q
+            const half_dt = 0.5 * dt;
+            const q_current = [4]T{ q0, q1, q2, q3 };
+
+            // Matrix-vector multiplication: omega * q
+            var q_dot = [4]T{ 0.0, 0.0, 0.0, 0.0 };
+            for (0..4) |i| {
+                for (0..4) |j| {
+                    q_dot[i] += omega[i][j] * q_current[j];
+                }
+            }
+
+            // Integrate: q_new = q + half_dt * q_dot
+            self.x[0] = q0 + half_dt * q_dot[0];
+            self.x[1] = q1 + half_dt * q_dot[1];
+            self.x[2] = q2 + half_dt * q_dot[2];
+            self.x[3] = q3 + half_dt * q_dot[3];
+
+            // Normalize quaternion
+            self.normalizeQuaternion();
+
+            // Jacobian matrix F
+            var F = std.mem.zeroes([7][7]T);
+
+            // Identity for bias states
+            F[4][4] = 1.0;
+            F[5][5] = 1.0;
+            F[6][6] = 1.0;
+
+            // Quaternion Jacobian
+            F[0][0] = 1.0;
+            F[0][1] = -half_dt * wx;
+            F[0][2] = -half_dt * wy;
+            F[0][3] = -half_dt * wz;
+            F[0][4] = half_dt * q1;
+            F[0][5] = half_dt * q2;
+            F[0][6] = half_dt * q3;
+
+            F[1][0] = half_dt * wx;
+            F[1][1] = 1.0;
+            F[1][2] = half_dt * wz;
+            F[1][3] = -half_dt * wy;
+            F[1][4] = -half_dt * q0;
+            F[1][5] = half_dt * q3;
+            F[1][6] = -half_dt * q2;
+
+            F[2][0] = half_dt * wy;
+            F[2][1] = -half_dt * wz;
+            F[2][2] = 1.0;
+            F[2][3] = half_dt * wx;
+            F[2][4] = -half_dt * q3;
+            F[2][5] = -half_dt * q0;
+            F[2][6] = half_dt * q1;
+
+            F[3][0] = half_dt * wz;
+            F[3][1] = half_dt * wy;
+            F[3][2] = -half_dt * wx;
+            F[3][3] = 1.0;
+            F[3][4] = half_dt * q2;
+            F[3][5] = -half_dt * q1;
+            F[3][6] = -half_dt * q0;
+
+            // Predict covariance: P = F*P*F^T + Q
+            var FP = std.mem.zeroes([7][7]T);
+            matrixMultiply(F, self.P, &FP);
+
+            var FPFt = std.mem.zeroes([7][7]T);
+            matrixMultiplyTranspose(FP, F, &FPFt);
+
+            matrixAdd(FPFt, self.Q, &self.P);
         }
-        norm = std.math.sqrt(norm);
-        if (norm > 1e-10) {
+
+        pub fn updateAccelerometer(self: *EKF, ax: T, ay: T, az: T) void {
+            // Normalize accelerometer
+            const norm = math.sqrt(ax * ax + ay * ay + az * az);
+            if (norm < 1e-6) return;
+
+            const ax_norm = ax / norm;
+            const ay_norm = ay / norm;
+            const az_norm = az / norm;
+
+            // Expected gravity vector in body frame
+            const q0 = self.x[0];
+            const q1 = self.x[1];
+            const q2 = self.x[2];
+            const q3 = self.x[3];
+
+            const expected = [3]T{
+                2.0 * (q1 * q3 - q0 * q2),
+                2.0 * (q0 * q1 + q2 * q3),
+                q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3,
+            };
+
+            // Measurement residual
+            const residual = [3]T{
+                ax_norm - expected[0],
+                ay_norm - expected[1],
+                az_norm - expected[2],
+            };
+
+            // Measurement Jacobian H
+            var H = std.mem.zeroes([3][7]T);
+            H[0][0] = -2.0 * q2;
+            H[0][1] = 2.0 * q3;
+            H[0][2] = -2.0 * q0;
+            H[0][3] = 2.0 * q1;
+
+            H[1][0] = 2.0 * q1;
+            H[1][1] = 2.0 * q0;
+            H[1][2] = 2.0 * q3;
+            H[1][3] = 2.0 * q2;
+
+            H[2][0] = 2.0 * q0;
+            H[2][1] = -2.0 * q1;
+            H[2][2] = -2.0 * q2;
+            H[2][3] = 2.0 * q3;
+
+            self.kalmanUpdate(H, residual, self.R_acc);
+        }
+
+        pub fn updateMagnetometer(self: *EKF, mx: T, my: T, mz: T) void {
+            // Normalize magnetometer
+            const norm = math.sqrt(mx * mx + my * my + mz * mz);
+            if (norm < 1e-6) return;
+
+            const mx_norm = mx / norm;
+            const my_norm = my / norm;
+            const mz_norm = mz / norm;
+
+            const q0 = self.x[0];
+            const q1 = self.x[1];
+            const q2 = self.x[2];
+            const q3 = self.x[3];
+
+            // Rotate magnetometer to earth frame to find reference
+            const hx = 2.0 * mx_norm * (0.5 - q2 * q2 - q3 * q3) +
+                2.0 * my_norm * (q1 * q2 - q0 * q3) +
+                2.0 * mz_norm * (q1 * q3 + q0 * q2);
+            const hy = 2.0 * mx_norm * (q1 * q2 + q0 * q3) +
+                2.0 * my_norm * (0.5 - q1 * q1 - q3 * q3) +
+                2.0 * mz_norm * (q2 * q3 - q0 * q1);
+
+            const bx = math.sqrt(hx * hx + hy * hy);
+            const bz = 2.0 * mx_norm * (q1 * q3 - q0 * q2) +
+                2.0 * my_norm * (q2 * q3 + q0 * q1) +
+                2.0 * mz_norm * (0.5 - q1 * q1 - q2 * q2);
+
+            // Expected magnetic field in body frame
+            const expected = [3]T{
+                2.0 * bx * (0.5 - q2 * q2 - q3 * q3) + 2.0 * bz * (q1 * q3 - q0 * q2),
+                2.0 * bx * (q1 * q2 - q0 * q3) + 2.0 * bz * (q0 * q1 + q2 * q3),
+                2.0 * bx * (q0 * q2 + q1 * q3) + 2.0 * bz * (0.5 - q1 * q1 - q2 * q2),
+            };
+
+            const residual = [3]T{
+                mx_norm - expected[0],
+                my_norm - expected[1],
+                mz_norm - expected[2],
+            };
+
+            // Simplified magnetometer Jacobian (approximate)
+            var H = std.mem.zeroes([3][7]T);
+            // This is a simplified version - full Jacobian is quite complex
+            H[0][0] = -2.0 * bz * q2;
+            H[0][1] = 2.0 * bz * q3;
+            H[0][2] = -4.0 * bx * q2 - 2.0 * bz * q0;
+            H[0][3] = -4.0 * bx * q3 + 2.0 * bz * q1;
+
+            self.kalmanUpdate(H, residual, self.R_mag);
+        }
+
+        fn kalmanUpdate(self: *EKF, H: [3][7]T, residual: [3]T, R: [3][3]T) void {
+            // S = H*P*H^T + R
+            var HP = std.mem.zeroes([3][7]T);
+            matrixMultiply3x7(H, self.P, &HP);
+
+            var S = R;
             for (0..3) |i| {
-                mag_norm[i] /= norm;
+                for (0..3) |j| {
+                    var sum: T = 0.0;
+                    for (0..7) |k| {
+                        sum += HP[i][k] * H[j][k];
+                    }
+                    S[i][j] += sum;
+                }
+            }
+
+            // Kalman gain K = P*H^T*S^(-1)
+            var Ht = std.mem.zeroes([7][3]T);
+            transpose3x7(H, &Ht);
+
+            var PHt = std.mem.zeroes([7][3]T);
+            matrixMultiply7x3(self.P, Ht, &PHt);
+
+            var S_inv = std.mem.zeroes([3][3]T);
+            if (!matrixInvert3x3(S, &S_inv)) return; // Skip update if singular
+
+            var K = std.mem.zeroes([7][3]T);
+            matrixMultiply7x3_3x3(PHt, S_inv, &K);
+
+            // Update state: x = x + K*residual
+            for (0..7) |i| {
+                for (0..3) |j| {
+                    self.x[i] += K[i][j] * residual[j];
+                }
+            }
+
+            // Update covariance: P = (I - K*H)*P
+            var KH = std.mem.zeroes([7][7]T);
+            matrixMultiply7x3_3x7(K, H, &KH);
+
+            var I_KH = std.mem.zeroes([7][7]T);
+            for (0..7) |i| {
+                for (0..7) |j| {
+                    I_KH[i][j] = if (i == j) 1.0 else 0.0;
+                    I_KH[i][j] -= KH[i][j];
+                }
+            }
+
+            var new_P = std.mem.zeroes([7][7]T);
+            matrixMultiply(I_KH, self.P, &new_P);
+            self.P = new_P;
+
+            self.normalizeQuaternion();
+        }
+
+        pub fn update(self: *EKF, gx: T, gy: T, gz: T, ax: T, ay: T, az: T, mx: T, my: T, mz: T, dt: T) void {
+            self.predict(gx, gy, gz, dt);
+            self.updateAccelerometer(ax, ay, az);
+            self.updateMagnetometer(mx, my, mz);
+        }
+
+        pub fn getEuler(self: *const EKF) struct { roll: T, pitch: T, yaw: T } {
+            const q0 = self.x[0];
+            const q1 = self.x[1];
+            const q2 = self.x[2];
+            const q3 = self.x[3];
+
+            const roll = math.atan2(2.0 * (q0 * q1 + q2 * q3), q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3);
+            const pitch = math.asin(2.0 * (q0 * q2 - q1 * q3));
+            var yaw = math.atan2(2.0 * (q0 * q3 + q1 * q2), q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3);
+
+            const rad_to_deg = 180.0 / math.pi;
+            yaw -= 0.0133808576; // Your declination correction
+
+            if (yaw > math.pi) yaw -= 2 * math.pi;
+            if (yaw < -math.pi) yaw += 2 * math.pi;
+
+            return .{
+                .roll = roll * rad_to_deg,
+                .pitch = pitch * rad_to_deg,
+                .yaw = yaw * rad_to_deg,
+            };
+        }
+
+        pub fn getQuaternion(self: *const EKF) [4]T {
+            return .{ self.x[0], self.x[1], self.x[2], self.x[3] };
+        }
+
+        fn normalizeQuaternion(self: *EKF) void {
+            const norm = math.sqrt(self.x[0] * self.x[0] + self.x[1] * self.x[1] +
+                self.x[2] * self.x[2] + self.x[3] * self.x[3]);
+            if (norm > 1e-6) {
+                self.x[0] /= norm;
+                self.x[1] /= norm;
+                self.x[2] /= norm;
+                self.x[3] /= norm;
             }
         }
 
-        // Current quaternion
-        const q0 = self.x[0];
-        const q1 = self.x[1];
-        const q2 = self.x[2];
-        const q3 = self.x[3];
-
-        // Expected measurements h(x)
-        var h = [_]f32{
-            2.0 * (q1 * q3 - q0 * q2),
-            2.0 * (q2 * q3 + q0 * q1),
-            q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3,
-            q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3,
-            2.0 * (q1 * q2 + q0 * q3),
-            2.0 * (q2 * q3 - q0 * q1),
-        };
-
-        // Measurement vector z
-        var z = [_]f32{
-            accel_norm[0],
-            accel_norm[1],
-            accel_norm[2],
-            mag_norm[0],
-            mag_norm[1],
-            mag_norm[2],
-        };
-
-        // Jacobian matrix H (6x4)
-        var H = [_]f32{0} ** 24;
-        H[0 * 4 + 0] = -2.0 * q2;
-        H[0 * 4 + 1] = 2.0 * q3;
-        H[0 * 4 + 2] = -2.0 * q0;
-        H[0 * 4 + 3] = 2.0 * q1;
-        H[1 * 4 + 0] = 2.0 * q1;
-        H[1 * 4 + 1] = 2.0 * q0;
-        H[1 * 4 + 2] = 2.0 * q3;
-        H[1 * 4 + 3] = 2.0 * q2;
-        H[2 * 4 + 0] = 2.0 * q0;
-        H[2 * 4 + 1] = -2.0 * q1;
-        H[2 * 4 + 2] = -2.0 * q2;
-        H[2 * 4 + 3] = 2.0 * q3;
-        H[3 * 4 + 0] = 2.0 * q0;
-        H[3 * 4 + 1] = 2.0 * q1;
-        H[3 * 4 + 2] = -2.0 * q2;
-        H[3 * 4 + 3] = -2.0 * q3;
-        H[4 * 4 + 0] = 2.0 * q3;
-        H[4 * 4 + 1] = 2.0 * q2;
-        H[4 * 4 + 2] = 2.0 * q1;
-        H[4 * 4 + 3] = 2.0 * q0;
-        H[5 * 4 + 0] = -2.0 * q1;
-        H[5 * 4 + 1] = -2.0 * q0;
-        H[5 * 4 + 2] = 2.0 * q3;
-        H[5 * 4 + 3] = 2.0 * q2;
-
-        // Innovation: y = z - h
-        var y = [_]f32{0} ** 6;
-        matSub(6, 1, &z, &h, &y);
-
-        // Innovation covariance: S = H * P * H' + R
-        var Ht = [_]f32{0} ** 24; // 4x6
-        var temp = [_]f32{0} ** 24; // 6x4
-        var S = [_]f32{0} ** 36; // 6x6
-        matTranspose(6, 4, &H, &Ht);
-        matMul(6, 4, 4, &H, self.P, &temp);
-        matMul(6, 4, 6, &temp, &Ht, &S);
-        matAdd(6, 6, &S, self.R, &S);
-
-        // Inverse of S
-        var inv_S = [_]f32{0} ** 36; // 6x6
-        try matInverse(6, &S, &inv_S, self.allocator);
-        // Kalman gain: K = P * H' * inv(S)
-        var temp2 = [_]f32{0} ** 24; // 4x6
-        var K = [_]f32{0} ** 24; // 4x6
-        matMul(4, 4, 6, self.P, &Ht, &temp2);
-        matMul(4, 6, 6, &temp2, &inv_S, &K);
-
-        // Update state: x = x + K * y
-        var K_y = [_]f32{0} ** 4;
-        matMul(4, 6, 1, &K, &y, &K_y);
-        for (0..4) |i| {
-            self.x[i] += K_y[i];
+        // Matrix operation helper functions
+        fn matrixMultiply(A: [7][7]T, B: [7][7]T, C: *[7][7]T) void {
+            for (0..7) |i| {
+                for (0..7) |j| {
+                    C[i][j] = 0.0;
+                    for (0..7) |k| {
+                        C[i][j] += A[i][k] * B[k][j];
+                    }
+                }
+            }
         }
-        self.normalizeQuatSlice();
 
-        // Update covariance: P = (I - K * H) * P
-        var KH = [_]f32{0} ** 16; // 4x4
-        var I_minus_KH = [_]f32{0} ** 16; // 4x4
-        var new_P = [_]f32{0} ** 16; // 4x4
-        matMul(4, 6, 4, &K, &H, &KH);
-        for (0..4) |i| {
-            I_minus_KH[i * 4 + i] = 1.0;
+        fn matrixMultiplyTranspose(A: [7][7]T, B: [7][7]T, C: *[7][7]T) void {
+            for (0..7) |i| {
+                for (0..7) |j| {
+                    C[i][j] = 0.0;
+                    for (0..7) |k| {
+                        C[i][j] += A[i][k] * B[j][k]; // B transposed
+                    }
+                }
+            }
         }
-        matSub(4, 4, &I_minus_KH, &KH, &I_minus_KH);
-        matMul(4, 4, 4, &I_minus_KH, self.P, &new_P);
-        @memcpy(self.P, &new_P);
-    }
 
-    // Get current quaternion
-    pub fn getQuaternion(self: Self) [4]f32 {
-        return .{ self.x[0], self.x[1], self.x[2], self.x[3] };
-    }
+        fn matrixAdd(A: [7][7]T, B: [7][7]T, C: *[7][7]T) void {
+            for (0..7) |i| {
+                for (0..7) |j| {
+                    C[i][j] = A[i][j] + B[i][j];
+                }
+            }
+        }
 
-    pub fn quaternionToEuler(self: Self) [3]f32 {
-        const q0 = self.x[0];
-        const q1 = self.x[1];
-        const q2 = self.x[2];
-        const q3 = self.x[3];
+        fn matrixMultiply3x7(A: [3][7]T, B: [7][7]T, C: *[3][7]T) void {
+            for (0..3) |i| {
+                for (0..7) |j| {
+                    C[i][j] = 0.0;
+                    for (0..7) |k| {
+                        C[i][j] += A[i][k] * B[k][j];
+                    }
+                }
+            }
+        }
 
-        const roll = std.math.atan2(2.0 * (q0 * q1 + q2 * q3), 1.0 - 2.0 * (q1 * q1 + q2 * q2));
-        const pitch = std.math.asin(2.0 * (q0 * q2 - q3 * q1));
-        const yaw = std.math.atan2(2.0 * (q0 * q3 + q1 * q2), 1.0 - 2.0 * (q2 * q2 + q3 * q3));
-        return .{ roll, pitch, yaw };
-    }
-};
+        fn matrixMultiply7x3(A: [7][7]T, B: [7][3]T, C: *[7][3]T) void {
+            for (0..7) |i| {
+                for (0..3) |j| {
+                    C[i][j] = 0.0;
+                    for (0..7) |k| {
+                        C[i][j] += A[i][k] * B[k][j];
+                    }
+                }
+            }
+        }
+
+        fn matrixMultiply7x3_3x3(A: [7][3]T, B: [3][3]T, C: *[7][3]T) void {
+            for (0..7) |i| {
+                for (0..3) |j| {
+                    C[i][j] = 0.0;
+                    for (0..3) |k| {
+                        C[i][j] += A[i][k] * B[k][j];
+                    }
+                }
+            }
+        }
+
+        fn matrixMultiply7x3_3x7(A: [7][3]T, B: [3][7]T, C: *[7][7]T) void {
+            for (0..7) |i| {
+                for (0..7) |j| {
+                    C[i][j] = 0.0;
+                    for (0..3) |k| {
+                        C[i][j] += A[i][k] * B[k][j];
+                    }
+                }
+            }
+        }
+
+        fn transpose3x7(A: [3][7]T, At: *[7][3]T) void {
+            for (0..3) |i| {
+                for (0..7) |j| {
+                    At[j][i] = A[i][j];
+                }
+            }
+        }
+
+        fn matrixInvert3x3(A: [3][3]T, A_inv: *[3][3]T) bool {
+            const det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
+                A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
+                A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+
+            if (@abs(det) < 1e-12) return false;
+
+            const inv_det = 1.0 / det;
+
+            A_inv[0][0] = (A[1][1] * A[2][2] - A[1][2] * A[2][1]) * inv_det;
+            A_inv[0][1] = (A[0][2] * A[2][1] - A[0][1] * A[2][2]) * inv_det;
+            A_inv[0][2] = (A[0][1] * A[1][2] - A[0][2] * A[1][1]) * inv_det;
+            A_inv[1][0] = (A[1][2] * A[2][0] - A[1][0] * A[2][2]) * inv_det;
+            A_inv[1][1] = (A[0][0] * A[2][2] - A[0][2] * A[2][0]) * inv_det;
+            A_inv[1][2] = (A[0][2] * A[1][0] - A[0][0] * A[1][2]) * inv_det;
+            A_inv[2][0] = (A[1][0] * A[2][1] - A[1][1] * A[2][0]) * inv_det;
+            A_inv[2][1] = (A[0][1] * A[2][0] - A[0][0] * A[2][1]) * inv_det;
+            A_inv[2][2] = (A[0][0] * A[1][1] - A[0][1] * A[1][0]) * inv_det;
+
+            return true;
+        }
+    };
+}
