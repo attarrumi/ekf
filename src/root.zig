@@ -11,13 +11,13 @@ pub fn EKF(comptime T: type) type {
         R_mag: [3][3]T,
 
         // GANTI: Tambahkan 4 parameter ke signature fungsi
-        pub fn init(q_quat: f64, q_bias: f64, r_acc: f64, r_mag: f64) Self {
+        pub fn init(q_quat: T, q_bias: T, r_acc: T, r_mag: T) Self {
             var ekf = Self{
                 .x = .{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
-                .P = std.mem.zeroes([7][7]f64),
-                .Q = std.mem.zeroes([7][7]f64),
-                .R_acc = std.mem.zeroes([3][3]f64),
-                .R_mag = std.mem.zeroes([3][3]f64),
+                .P = std.mem.zeroes([7][7]T),
+                .Q = std.mem.zeroes([7][7]T),
+                .R_acc = std.mem.zeroes([3][3]T),
+                .R_mag = std.mem.zeroes([3][3]T),
             };
 
             // Inisialisasi P tetap sama
@@ -294,7 +294,7 @@ pub fn EKF(comptime T: type) type {
             self.updateMagnetometer(mx, my, mz);
         }
 
-        pub fn getEuler(self: *const Self) struct { roll: T, pitch: T, yaw: T } {
+        pub fn getEuler(self: *const Self, decline: T) struct { roll: T, pitch: T, yaw: T } {
             const q0 = self.x[0];
             const q1 = self.x[1];
             const q2 = self.x[2];
@@ -305,7 +305,8 @@ pub fn EKF(comptime T: type) type {
             var yaw = math.atan2(2.0 * (q0 * q3 + q1 * q2), q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3);
 
             const rad_to_deg = 180.0 / math.pi;
-            yaw -= 0.0133808576; // Your declination correction
+            yaw -= decline; // Your declination correction
+            // yaw -= 0.0133808576; // Your declination correction
 
             if (yaw > math.pi) yaw -= 2 * math.pi;
             if (yaw < -math.pi) yaw += 2 * math.pi;
